@@ -1,0 +1,7 @@
+pandas
+upsetplot
+matplotlib
+bokeh
+numpy
+scikit-learn
+scipy
