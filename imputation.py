@@ -96,7 +96,7 @@ def impute_by_age(train_df, test_df):
     return new_tr, new_ts
 
 
-def imputation_eval(df, ins_col_dict, alpha, n_iter, n_neighbors):
+def imputation_eval(df, alpha, n_iter, n_neighbors, mdp='MCAR', ins_col_dict=None):
     """
     This function evaluates the KNN imputation technique with simulates MCAR
     at desired alpha frequency. Raw bias (RB), percent bias (PB), coverage rate (CR)
@@ -111,25 +111,45 @@ def imputation_eval(df, ins_col_dict, alpha, n_iter, n_neighbors):
     Parameters
     ----------
     df: dataframe
-    ins_col_dict: dictionary of instrument (keys) and column names (values),
-        according to df order
     alpha: float
         frequency of MCAR information
     n_iter: int
         number of iterations
     n_neighbors: int number of neighbors to consider for KNNImputer
+    mdp: str
+        Missing data pattern, "MCAR", "MAR" available
+    ins_col_dict: (default None), if not None dictionary
+        of instrument (keys) and column names (values),
+        according to df order
+    Returns
+    -------
+    eval parameters (mean, quantiles) as namedtuple and dictionary of namedtuples
     """
     imputation_scores = namedtuple('imputation_scores', ['RB', 'PB', 'CR', 'AW', 'RMSE'])
     imputer = KNNImputer(n_neighbors=n_neighbors)
-    dict_dfmis = {n: imputer.fit_transform(_mcar_dataset(df, ins_col_dict, alpha))
-                  for n in range(n_iter)}
-    true_mean = np.mean(df.apply(np.mean, axis=0))
-    sample_mean = np.mean([np.mean(np.mean(dict_dfmis[n], axis=0)) for n in range(n_iter)])
+    if mdp == "MCAR":
+        if ins_col_dict is None:
+            logging.error("Please add a dictionary of the form:"
+                          " k = instrument name; value: column names.")
+        dict_dfmis = {n: imputer.fit_transform(_mcar_dataset(df, ins_col_dict, alpha))
+                      for n in range(n_iter)}
+    else:
+        dict_dfmis = {n: imputer.fit_transform(_mar_dataset(df, alpha))
+                      for n in range(n_iter)}
+    true_mean = np.mean(np.mean(df, axis=0))
+    true_quant = np.mean(np.quantile(df, q=[0.25, 0.5, 0.75], axis=0), axis=1)
+
+    sample_mean = np.mean(np.mean([np.mean(dict_dfmis[n], axis=0) for n in range(n_iter)],
+                                  axis=1))
+    sample_quant = np.mean(np.mean([np.quantile(dict_dfmis[n], q=[0.25, 0.5, 0.75],
+                                                axis=0) for n in range(n_iter)], axis=2), axis=0)
+
+    # Mean statistics
     count = [0] * df.shape[1]
     awd_vect = [0] * df.shape[1]
     for n in range(n_iter):
         ci_vect = [_confint(dict_dfmis[n][:, idx]) for idx in range(df.shape[1])]
-        for idx, m in enumerate(df.apply(np.mean, axis=0)):
+        for idx, m in enumerate(np.mean(df, axis=0)):
             awd_vect[idx] += ci_vect[idx][1] - ci_vect[idx][0]
             if ci_vect[idx][0] < m < ci_vect[idx][1]:
                 count[idx] += 1
@@ -138,11 +158,36 @@ def imputation_eval(df, ins_col_dict, alpha, n_iter, n_neighbors):
     cr = np.mean(count_perc)
     aw = np.mean(awd_perc)
     rmse = np.sqrt((sample_mean - true_mean) ** 2)
-    scores = imputation_scores(RB=sample_mean - true_mean,
-                               PB=100 * (abs((sample_mean - true_mean) / true_mean)),
-                               CR=cr,
-                               AW=aw, RMSE=rmse)
-    return scores
+
+    scores_m = imputation_scores(RB=sample_mean - true_mean,
+                                 PB=100 * (abs((sample_mean - true_mean) / true_mean)),
+                                 CR=cr,
+                                 AW=aw,
+                                 RMSE=rmse)
+    # Quantiles Q1, Q2, Q3
+    scores_q = {}
+    for idx, q in enumerate([0.25, 0.5, 0.75]):
+        count = [0] * df.shape[1]
+        awd_vect = [0] * df.shape[1]
+        for n in range(n_iter):
+            ci_vect = [_confintq(dict_dfmis[n][:, feat], q) for feat in range(df.shape[1])]
+            for i, qval in enumerate(np.quantile(df, q=[0.25, 0.5, 0.75], axis=0)[idx, :]):
+                awd_vect[i] += ci_vect[i][1] - ci_vect[i][0]
+                if ci_vect[i][0] < qval < ci_vect[i][1]:
+                    count[idx] += 1
+        count_perc = [c / n_iter for c in count]
+        awd_perc = [c / n_iter for c in awd_vect]
+        cr = np.mean(count_perc)
+        aw = np.mean(awd_perc)
+        rmse = np.sqrt((sample_quant[idx] - true_quant[idx]) ** 2)
+
+        scores_q[q] = imputation_scores(RB=sample_quant[idx] - true_quant[idx],
+                                        PB=100 * (abs((sample_quant[idx] - true_quant[idx]) / true_quant[idx])),
+                                        CR=cr,
+                                        AW=aw,
+                                        RMSE=rmse)
+
+    return scores_m, scores_q
 
 
 """
@@ -185,12 +230,62 @@ def _mcar_dataset(df, ins_col_dict, alpha=0.20):
     sample_idx = []
     for u in uniq_patt:
         idx_list = [idx for idx, el in enumerate(rand_mat) if np.array_equal(u, el)]
-        sample_idx.extend(np.random.choice(idx_list,
-                                           math.ceil(alpha * len(idx_list))).tolist())
+        sample_idx.extend(np.unique(np.random.choice(idx_list,
+                                                     math.ceil(alpha * len(idx_list))).tolist()))
     df_cp = df.copy()
     for idx in sample_idx:
         df_cp.iloc[idx] = df.iloc[idx].mask([bool(a) for a in np.repeat(rand_mat[idx],
                                                                         len_col)],
+                                            None)
+    return df_cp
+
+
+def _mar_dataset(df, alpha=0.20):
+    """
+    Function that takes as input a complete dataframe
+    and returns a dataframe with MAR values according
+    to (Brand, J., P., L., 1999) imputation theory.
+    Parameters
+    ----------
+    df: dataframe
+    alpha: percentage of missing information
+    Returns
+    -------
+    dataframe
+    """
+    rand_mat = np.random.randint(0, 2, df.shape)
+    uniq_patt = np.unique(rand_mat, axis=0)
+    # weights
+    a_mat = np.random.randint(0, 2, df.shape)
+    g_mat = np.random.randint(0, 5, (df.shape[0], 3))  # nxk with k quantiles (k=3)
+
+    choose_idx = []
+    for u in uniq_patt:
+        idx_list = [idx for idx, el in enumerate(rand_mat) if np.array_equal(u, el)]
+        if len(idx_list) == 1:
+            choose_idx.extend(idx_list)
+        else:
+            sample_idx = []
+            for idx in idx_list:
+                s = sum(a_mat[idx, :] * u * df.iloc[idx])
+                theta = [0, 0.25, 0.5, 0.75, 1]
+                c = np.quantile(df.iloc[idx], theta[1:4])
+                qidx = np.where(c > s)[0]
+                print(qidx, c, s)
+                if len(qidx) == 0:
+                    sample_idx.append(idx)
+                elif np.min(qidx) == 0:
+                    sample_idx.append(idx)
+                else:
+                    num = (alpha * g_mat[idx, qidx[0] - 1])
+                    den = [0.25] + [(theta[n + 1] - theta[n]) * g_mat[idx][n - 1] for n in range(1, 4)]
+                    frac = num / sum(den)
+                    sample_idx.extend([idx] * math.ceil(frac))
+            choose_idx.extend(np.unique(np.random.choice(sample_idx, len(idx_list))))
+
+    df_cp = df.copy()
+    for idx in choose_idx:
+        df_cp.iloc[idx] = df.iloc[idx].mask([bool(a) for a in 1 - rand_mat[idx]],
                                             None)
     return df_cp
 
@@ -207,3 +302,17 @@ def _confint(vect):
     error = stats.t.ppf(1 - (0.05 / 2), len(vect) - 1) * (np.std(vect) / math.sqrt(len(vect)))
     mean = np.mean(vect)
     return mean - error, mean + error
+
+
+def _confintq(vect, q):
+    """
+    Parameters
+    ----------
+    vect: list (of performance scores)
+    Returns
+    ------
+    tuple : mean and error
+    """
+    error = stats.t.ppf(1 - (0.05 / 2), len(vect) - 1) * (np.std(vect) / math.sqrt(len(vect)))
+    quant = np.quantile(vect, q)
+    return quant - error, quant + error
