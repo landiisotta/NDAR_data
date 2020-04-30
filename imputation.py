@@ -7,6 +7,8 @@ import numpy as np
 import math
 from collections import namedtuple
 from scipy import stats
+from scipy.stats.mstats import mquantiles_cimj
+from create_dataset import concatenate_all_ins
 
 
 def prepare_imputation(ins_dict, missing_perc=0.35):
@@ -27,6 +29,7 @@ def prepare_imputation(ins_dict, missing_perc=0.35):
     """
     max_perc = 0
     new_dict = {}
+    all_perc = []
     for k, df in ins_dict.items():
         if k == 'srs':
             chk_col = ['aware_t_score', 'cog_t_score',
@@ -48,7 +51,8 @@ def prepare_imputation(ins_dict, missing_perc=0.35):
         for s in ['P3', 'P4', 'P5']:
             idx += new_dict[k].loc[new_dict[k].interview_period == s].index.tolist()
         new_dict[k] = new_dict[k].drop(idx)
-        perc = _check_na_perc(new_dict[k])
+        perc, m_perc = _check_na_perc(new_dict[k])
+        all_perc.append(m_perc)
         if perc > max_perc:
             max_perc = perc
     if max_perc < missing_perc * 100:
@@ -57,7 +61,16 @@ def prepare_imputation(ins_dict, missing_perc=0.35):
     else:
         logging.warning(f'At leas one feature exceeds the maximum percentage of '
                         f'missing information, which is set at {missing_perc * 100}%')
+    logging.info(f'The average percentage of missing information is {np.mean(all_perc)}')
     return new_dict
+
+
+def prepare_mcar_imputation(ins_dict):
+    df = concatenate_all_ins(ins_dict)
+    perc, m_perc = _check_na_perc(df)
+    logging.info(f'Maximum percentage of missing information: {perc}%')
+    logging.info(f'Average percentage of missing information {m_perc}')
+    return df
 
 
 def impute_by_age(train_df, test_df):
@@ -125,68 +138,58 @@ def imputation_eval(df, alpha, n_iter, n_neighbors, mdp='MCAR', ins_col_dict=Non
     -------
     eval parameters (mean, quantiles) as namedtuple and dictionary of namedtuples
     """
-    imputation_scores = namedtuple('imputation_scores', ['RB', 'PB', 'CR', 'AW', 'RMSE'])
+    imputation_scores = namedtuple('imputation_scores', ['RB', 'PB', 'CR', 'AW'])
+    quantiles = [0.25, 0.5, 0.75]
     imputer = KNNImputer(n_neighbors=n_neighbors)
     if mdp == "MCAR":
         if ins_col_dict is None:
             logging.error("Please add a dictionary of the form:"
-                          " k = instrument name; value: column names.")
+                          " k: instrument name; value: column names.")
         dict_dfmis = {n: imputer.fit_transform(_mcar_dataset(df, ins_col_dict, alpha))
                       for n in range(n_iter)}
     else:
         dict_dfmis = {n: imputer.fit_transform(_mar_dataset(df, alpha))
                       for n in range(n_iter)}
-    true_mean = np.mean(np.mean(df, axis=0))
-    true_quant = np.mean(np.quantile(df, q=[0.25, 0.5, 0.75], axis=0), axis=1)
-
+    true_mean = np.mean(np.mean(df, axis=0))  # 1 x 1
+    true_quant = np.mean(np.quantile(df, q=quantiles, axis=0), axis=1)  # 1 x 3
     sample_mean = np.mean(np.mean([np.mean(dict_dfmis[n], axis=0) for n in range(n_iter)],
-                                  axis=1))
-    sample_quant = np.mean(np.mean([np.quantile(dict_dfmis[n], q=[0.25, 0.5, 0.75],
-                                                axis=0) for n in range(n_iter)], axis=2), axis=0)
-
-    # Mean statistics
-    count = [0] * df.shape[1]
-    awd_vect = [0] * df.shape[1]
+                                  axis=1))  # 1 x 1
+    sample_quant = np.mean(np.mean([np.quantile(dict_dfmis[n], q=quantiles,
+                                                axis=0) for n in range(n_iter)], axis=2), axis=0)  # 1 x 3
+    awd_vect, count = [0] * df.shape[1], [0] * df.shape[1]
+    awd_vectq, count_q = [[0] * 3] * df.shape[1], [[0] * 3] * df.shape[1]
     for n in range(n_iter):
-        ci_vect = [_confint(dict_dfmis[n][:, idx]) for idx in range(df.shape[1])]
-        for idx, m in enumerate(np.mean(df, axis=0)):
-            awd_vect[idx] += ci_vect[idx][1] - ci_vect[idx][0]
-            if ci_vect[idx][0] < m < ci_vect[idx][1]:
-                count[idx] += 1
+        ci_vect = [_confint(dict_dfmis[n][:, idx]) for idx in range(df.shape[1])]  # n_feat tuples 2-dim
+        ci_vect_q = [mquantiles_cimj(dict_dfmis[n][:, feat], quantiles) for feat in  # n_feat tuples 2 x 3
+                     range(df.shape[1])]
+        for m, q in zip(enumerate(np.mean(df, axis=0)),
+                        enumerate(np.quantile(df, q=quantiles, axis=0).transpose())):
+            awd_vect[m[0]] += ci_vect[m[0]][1] - ci_vect[m[0]][0]
+            awd_vectq[q[0]] = np.add(awd_vectq[q[0]],
+                                     np.array(
+                                         [ci_vect_q[q[0]][1][qidx] - ci_vect_q[q[0]][0][qidx] for qidx in range(3)]))
+            count[m[0]] += int(ci_vect[m[0]][0] <= m[1] <= ci_vect[m[0]][1])
+            count_q[q[0]] = np.add(count_q[q[0]], np.array(
+                [int(ci_vect_q[q[0]][0][i] <= q[1][i] <= ci_vect_q[q[0]][1][i]) for i in range(3)]))
+
     count_perc = [c / n_iter for c in count]
     awd_perc = [c / n_iter for c in awd_vect]
     cr = np.mean(count_perc)
     aw = np.mean(awd_perc)
-    rmse = np.sqrt((sample_mean - true_mean) ** 2)
+
+    count_perc_q = np.array([np.divide(c, n_iter) for c in count_q])
+    awd_perc_q = np.array([np.divide(c, n_iter) for c in awd_vectq])
+    cr_q = [np.mean(count_perc_q[:, idx]) for idx in range(3)]
+    aw_q = [np.mean(awd_perc_q[~np.isnan(awd_perc_q[:, idx]), idx]) for idx in range(3)]
 
     scores_m = imputation_scores(RB=sample_mean - true_mean,
                                  PB=100 * (abs((sample_mean - true_mean) / true_mean)),
                                  CR=cr,
-                                 AW=aw,
-                                 RMSE=rmse)
-    # Quantiles Q1, Q2, Q3
-    scores_q = {}
-    for idx, q in enumerate([0.25, 0.5, 0.75]):
-        count = [0] * df.shape[1]
-        awd_vect = [0] * df.shape[1]
-        for n in range(n_iter):
-            ci_vect = [_confintq(dict_dfmis[n][:, feat], q) for feat in range(df.shape[1])]
-            for i, qval in enumerate(np.quantile(df, q=[0.25, 0.5, 0.75], axis=0)[idx, :]):
-                awd_vect[i] += ci_vect[i][1] - ci_vect[i][0]
-                if ci_vect[i][0] < qval < ci_vect[i][1]:
-                    count[idx] += 1
-        count_perc = [c / n_iter for c in count]
-        awd_perc = [c / n_iter for c in awd_vect]
-        cr = np.mean(count_perc)
-        aw = np.mean(awd_perc)
-        rmse = np.sqrt((sample_quant[idx] - true_quant[idx]) ** 2)
-
-        scores_q[q] = imputation_scores(RB=sample_quant[idx] - true_quant[idx],
-                                        PB=100 * (abs((sample_quant[idx] - true_quant[idx]) / true_quant[idx])),
-                                        CR=cr,
-                                        AW=aw,
-                                        RMSE=rmse)
-
+                                 AW=aw)
+    scores_q = {q: imputation_scores(RB=sample_quant[idx] - true_quant[idx],
+                                     PB=100 * (abs((sample_quant[idx] - true_quant[idx]) / true_quant[idx])),
+                                     CR=cr_q[idx],
+                                     AW=aw_q[idx]) for idx, q in enumerate(quantiles)}
     return scores_m, scores_q
 
 
@@ -198,12 +201,14 @@ Private functions
 def _check_na_perc(df):
     nobs = df.shape[0]
     max_perc = 0
+    perc_vect = []
     for col in df.columns:
         if not re.search('interview|sex|resp|relat', col):
             perc = (sum(df[[col]].isna().astype(int).sum()) / nobs) * 100
+            perc_vect.append(perc)
             if perc > max_perc:
                 max_perc = perc
-    return max_perc
+    return max_perc, np.mean(perc_vect)
 
 
 def _mcar_dataset(df, ins_col_dict, alpha=0.20):
@@ -228,7 +233,7 @@ def _mcar_dataset(df, ins_col_dict, alpha=0.20):
     rand_mat = np.random.randint(0, 2, (df.shape[0], len(ins_col_dict.keys())))
     uniq_patt = np.unique(rand_mat, axis=0)
     sample_idx = []
-    for u in uniq_patt:
+    for u in list(filter(lambda x: sum(x) != df.shape[1], uniq_patt)):
         idx_list = [idx for idx, el in enumerate(rand_mat) if np.array_equal(u, el)]
         sample_idx.extend(np.unique(np.random.choice(idx_list,
                                                      math.ceil(alpha * len(idx_list))).tolist()))
@@ -253,14 +258,16 @@ def _mar_dataset(df, alpha=0.20):
     -------
     dataframe
     """
-    rand_mat = np.random.randint(0, 2, df.shape)
+    f = np.random.choice(range(df.shape[0]), df.shape[0])
+    rand_mat = np.random.randint(0, 2, df.shape)[f]
     uniq_patt = np.unique(rand_mat, axis=0)
     # weights
     a_mat = np.random.randint(0, 2, df.shape)
     g_mat = np.random.randint(0, 5, (df.shape[0], 3))  # nxk with k quantiles (k=3)
 
     choose_idx = []
-    for u in uniq_patt:
+    for u in list(filter(lambda x: sum(x) != df.shape[1], uniq_patt)):
+        # print(u)
         idx_list = [idx for idx, el in enumerate(rand_mat) if np.array_equal(u, el)]
         if len(idx_list) == 1:
             choose_idx.extend(idx_list)
@@ -270,17 +277,17 @@ def _mar_dataset(df, alpha=0.20):
                 s = sum(a_mat[idx, :] * u * df.iloc[idx])
                 theta = [0, 0.25, 0.5, 0.75, 1]
                 c = np.quantile(df.iloc[idx], theta[1:4])
-                qidx = np.where(c > s)[0]
-                print(qidx, c, s)
-                if len(qidx) == 0:
-                    sample_idx.append(idx)
-                elif np.min(qidx) == 0:
+                ctr = sum([c > s][0])
+                if ctr == 0:
                     sample_idx.append(idx)
                 else:
-                    num = (alpha * g_mat[idx, qidx[0] - 1])
+                    num = (alpha * g_mat[idx, np.where(c > s)[0][0] - 1])
                     den = [0.25] + [(theta[n + 1] - theta[n]) * g_mat[idx][n - 1] for n in range(1, 4)]
                     frac = num / sum(den)
-                    sample_idx.extend([idx] * math.ceil(frac))
+                    if frac > 0:
+                        sample_idx.extend([idx] * int(frac * 100))
+                    else:
+                        sample_idx.append(idx)
             choose_idx.extend(np.unique(np.random.choice(sample_idx, len(idx_list))))
 
     df_cp = df.copy()
@@ -302,17 +309,3 @@ def _confint(vect):
     error = stats.t.ppf(1 - (0.05 / 2), len(vect) - 1) * (np.std(vect) / math.sqrt(len(vect)))
     mean = np.mean(vect)
     return mean - error, mean + error
-
-
-def _confintq(vect, q):
-    """
-    Parameters
-    ----------
-    vect: list (of performance scores)
-    Returns
-    ------
-    tuple : mean and error
-    """
-    error = stats.t.ppf(1 - (0.05 / 2), len(vect) - 1) * (np.std(vect) / math.sqrt(len(vect)))
-    quant = np.quantile(vect, q)
-    return quant - error, quant + error

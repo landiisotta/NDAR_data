@@ -2,8 +2,8 @@ import re
 import numpy as np
 import pandas as pd
 from bokeh.models import LinearColorMapper, BasicTicker, PrintfTickFormatter, \
-    ColorBar, HoverTool
-from bokeh.plotting import figure, show
+    ColorBar, HoverTool, ColumnDataSource, CategoricalColorMapper
+from bokeh.plotting import figure, show, output_notebook
 from bokeh.io import export_svgs
 from math import pi
 from matplotlib import pyplot as plt
@@ -205,29 +205,27 @@ def plot_dist(df, feat, print_mean=False, size=(10, 15), name=None):
 def plot_metrics(cv_score, figsize=(20, 10)):
     """
     Function that plot the average performance (i.e., normalized stability) over cross-validation
-    for training and validation sets. Plot is saved in out folder.
+    for training and validation sets.
 
     Parameters
     ----------
     cv_score: dictionary
-        Dictionary with all the CV metrics as output by search_best_nclust() function.
     figsize: tuple (width, height)
     """
     fig, ax = plt.subplots(figsize=figsize)
     ax.plot(list(cv_score['train'].keys()),
-            [np.mean(me) for me in cv_score['train'].values()],
+            [me[0] for me in cv_score['train'].values()],
             label='training set')
     ax.errorbar(list(cv_score['val'].keys()),
-                [np.mean(me) for me in cv_score['val'].values()],
-                [_confint(me) for me in cv_score['val'].values()],
+                [me[0] for me in cv_score['val'].values()],
+                [me[1][1] for me in cv_score['val'].values()],
                 label='validation set')
     ax.legend()
     plt.xticks([lab for lab in cv_score['train'].keys()])
     plt.xlabel('Number of clusters')
     plt.ylabel('Normalized stability')
+    plt.title('UMAP preprocessed dataset')
     plt.show()
-    plt.savefig(f"./out/performance_cv_nclust{(len(cv_score['train'].keys()) + 1)}",
-                format='pdf')
 
 
 def plot_dendrogram(model, **kwargs):
@@ -268,3 +266,68 @@ def _confint(vect):
     """
     error = np.mean(vect)
     return 1.96 * math.sqrt((error * (1 - error)) / len(vect))
+
+
+def _scatter_plot(umap_mtx,
+                  pid_subc_list,
+                  colors,
+                  fig_height,
+                  fig_width,
+                  label,
+                  title=''):
+    """Bokeh scatterplot to visualize in jupyter clusters and subject info.
+
+    Parameters
+    ----------
+    umap_mtx: np array
+        Array with UMAP projections
+    pid_subc_list: list of tuples
+        list of pids ordered as in umap_mtx and subcluster labels
+    colors: list
+        Color list
+    fig_height, fig_width: int
+        Figure dimensions
+    label: dict dictionary of class numbers and subtype labels
+    title: str
+    """
+
+    pid_list = list(map(lambda x: x[0], pid_subc_list))
+    subc_list = list(map(lambda x: x[1], pid_subc_list))
+    df_dict = {'x': umap_mtx[:, 0].tolist(),
+               'y': umap_mtx[:, 1].tolist(),
+               'pid_list': pid_list,
+               'subc_list': subc_list}
+
+    df = pd.DataFrame(df_dict).sort_values('subc_list')
+
+    source = ColumnDataSource(dict(
+        x=df['x'].tolist(),
+        y=df['y'].tolist(),
+        pid=df['pid_list'].tolist(),
+        subc=list(map(lambda x: label[str(x)], df['subc_list'].tolist())),
+        col_class=[str(i) for i in df['subc_list'].tolist()]))
+
+    labels = [str(i) for i in df['subc_list']]
+    cmap = CategoricalColorMapper(factors=sorted(pd.unique(labels)),
+                                  palette=colors)
+    TOOLTIPS = [('pid', '@pid'),
+                ('subc', '@subc')]
+
+    plotTools = 'box_zoom, wheel_zoom, pan,  crosshair, reset, save'
+
+    output_notebook()
+    p = figure(plot_width=fig_width * 50, plot_height=fig_height * 50,
+               tools=plotTools, title=title)
+    p.add_tools(HoverTool(tooltips=TOOLTIPS))
+    p.circle('x', 'y', legend_group='subc', source=source,
+             color={'field': 'col_class',
+                    "transform": cmap}, size=8)
+    p.xaxis.major_tick_line_color = None
+    p.xaxis.minor_tick_line_color = None
+    p.yaxis.major_tick_line_color = None
+    p.yaxis.minor_tick_line_color = None
+    p.xaxis.major_label_text_color = None
+    p.yaxis.major_label_text_color = None
+    p.grid.grid_line_color = None
+    p.legend.location = 'top_right'
+    show(p)

@@ -169,6 +169,21 @@ def concatenate_instrument(ins_dict, save=False):
     return wide_df
 
 
+def concatenate_all_ins(ins_dict, save=False):
+    try:
+        ins_dict['ados'].columns = ['_'.join([c, 'ados']) for c in ins_dict['ados'].columns]
+    except KeyError:
+        pass
+    df_mcar = pd.concat([df[[col for col in df.columns
+                             if not re.search('interview|sex|respond|relation', col)]]
+                         for df in ins_dict.values()], axis=1)
+
+    if save:
+        pkl.dump(df_mcar, open(os.path.join(ut.out_folder,
+                                            'mcar_wide_dataset.pkl'), 'wb'))
+    return df_mcar
+
+
 """
 Private functions
 """
