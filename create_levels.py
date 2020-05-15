@@ -3,6 +3,7 @@ import utils as ut
 from collections import namedtuple
 import logging
 import os
+import re
 
 # These named tuples are used to code the DSM-5 vs ADI-R/ADOS
 # conversion table, as described by doi: 10.1176/appi.ajp.2012.12020276
@@ -224,17 +225,19 @@ class CreateLevels:
         """
         # Recode 999=None
         logging.info('Processing MULLEN')
+        id_subj = set()
+        df_instrument.reset_index(inplace=True)
         for cn in col_names:
             df_instrument.loc[df_instrument[cn] >= 777, cn] = None  # 999=NA/missing
             df_instrument.loc[df_instrument[cn] < 0, cn] = None  # -999=NA/missing
+            id_subj.update(df_instrument.loc[df_instrument[cn] <= 20, cn].index.tolist())  # <=20 not coded
         # Drop duplicate subjects with the same assessment age and feature scores
         cnrow = df_instrument.shape[0]  # store current number of subjects
         # Drop subjects with completely missing information
-        df_instrument.reset_index(inplace=True)
-        drop_obs = _drop_obs(df_instrument[col_names])
+        drop_obs = list(id_subj.union(_drop_obs(df_instrument[col_names])))
         df_instrument.drop(drop_obs, axis=0, inplace=True)
         logging.info(f'Dropped {cnrow - df_instrument.shape[0]} '
-                     f'observations with completely missing information')
+                     f'observations with completely missing information or scores <=20')
         cnrow = df_instrument.shape[0]
         df_instrument.drop_duplicates(['subjectkey',
                                        'interview_age'] +
@@ -287,10 +290,12 @@ class CreateLevels:
                               sort=False)
         # Replace with NAs entries that are not conform
         for cn in df_concat.columns.intersection(col_names):
-            df_concat.loc[df_concat[cn] >= 999, cn] = None  # 999=NA/missing
+            df_concat.loc[df_concat[cn] > 140, cn] = None  # 999=NA/missing
             df_concat.loc[df_concat[cn] < 0, cn] = None  # -999=NA/missing
             if cn == 'relationship':
                 df_concat.loc[df_concat[cn] == 27, cn] = None  # 27=Missing data
+            elif re.search('_vscore', cn):
+                df_concat.loc[df_concat[cn] > 24, cn] = None  # 24=Upper bound
         # Drop 2 subjects (see utils file)
         # that have wrong entries
         df_concat.drop(ut.drop_subj_vine, axis=0, inplace=True)
@@ -314,7 +319,7 @@ class CreateLevels:
                               axis=0, inplace=True)
         df_concat.index = df_concat['subjectkey']
         df_concat.drop('subjectkey', axis=1, inplace=True)
-        df_concat['interview_period'] = _generate_age_bins(df_concat.interview_age)
+        df_concat.insert(0, 'interview_period', _generate_age_bins(df_concat.interview_age))
         logging.info(f'Dropped {cnrow - df_concat.shape[0]} duplicated observations')
         logging.info(f'Current number of observation: {df_concat.shape[0]}\n\n')
         return df_concat
@@ -386,7 +391,7 @@ class CreateLevels:
                               axis=0, inplace=True)
         df_concat.index = df_concat['subjectkey']
         df_concat.drop('subjectkey', axis=1, inplace=True)
-        df_concat['interview_period'] = _generate_age_bins(df_concat.interview_age)
+        df_concat.insert(0, 'interview_period', _generate_age_bins(df_concat.interview_age))
         logging.info(f'Dropped {cnrow - df_concat.shape[0]} duplicated observations')
         logging.info(f'Current number of observation: {df_concat.shape[0]}\n\n')
         return df_concat

@@ -88,7 +88,6 @@ def dataset(phenotype=None):
                     {k: ins for k, ins in instrument_dict.items() if re.match('vineland', k)},
                     ut.vineland_col_names,
                     ut.vineland_mergecol)
-
     long_info = data.assess_longitudinal({k: new_dict[k] for k in new_dict.keys() if k != 'ados'})
     cs_dict = {}
     # Generate cross-sectional data

@@ -5,3 +5,4 @@ bokeh
 numpy
 scikit-learn
 scipy
+umap-learn

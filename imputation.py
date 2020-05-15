@@ -9,18 +9,24 @@ from collections import namedtuple
 from scipy import stats
 from scipy.stats.mstats import mquantiles_cimj
 from create_dataset import concatenate_all_ins
+import pickle as pkl
 
 
-def prepare_imputation(ins_dict, missing_perc=0.35):
+def prepare_imputation(ins_dict, age_period='P2', missing_perc=0.35):
     """
     This function
     - excludes subjects from SRS that completely miss subscale scores;
     - exclude GM dimension from Mullen, B2/3 from ADOS, and written score form Vineland;
     - reduce datasets to only P1-P2 interview period [TBD if we add Wechsler subscales].
+    **MODIFIED**
+    !!We consider only subjects with user defined interview age, default = P2
+     and we retrieve longitudinal information if available
 
+    Only subjects with
     Parameters
     ----------
     ins_dict: dictionary of instruments dataframes
+    age_period: str
     missing_perc: float
         maximum amount of missing information allowed
     Returns
@@ -31,26 +37,21 @@ def prepare_imputation(ins_dict, missing_perc=0.35):
     new_dict = {}
     all_perc = []
     for k, df in ins_dict.items():
+        new_dict[k] = df.loc[df.interview_period == age_period].copy()
         if k == 'srs':
             chk_col = ['aware_t_score', 'cog_t_score',
                        'comm_t_score', 'motiv_t_score',
                        'manner_t_score']
-            bool_df = df[chk_col].isna().astype(int)
+            bool_df = new_dict[k][chk_col].isna().astype(int)
             vect_count = bool_df.apply(sum, axis=1)
             drop_subj = vect_count.loc[vect_count >= 5].index
-            new_dict[k] = df.drop(drop_subj)
+            new_dict[k].drop(drop_subj, inplace=True)
         elif k == 'ados':
-            new_dict[k] = df.drop(['B2', 'B3'], axis=1)
+            new_dict[k].drop(['B2', 'B3'], axis=1, inplace=True)
         elif k == 'mullen':
-            new_dict[k] = df.drop(['scoresumm_gm_t_score'], axis=1)
+            new_dict[k].drop(['scoresumm_gm_t_score'], axis=1, inplace=True)
         elif k == 'vineland':
-            new_dict[k] = df.drop(['written_vscore'], axis=1)
-        else:
-            new_dict[k] = df
-        idx = []
-        for s in ['P3', 'P4', 'P5']:
-            idx += new_dict[k].loc[new_dict[k].interview_period == s].index.tolist()
-        new_dict[k] = new_dict[k].drop(idx)
+            new_dict[k].drop(['written_vscore'], axis=1, inplace=True)
         perc, m_perc = _check_na_perc(new_dict[k])
         all_perc.append(m_perc)
         if perc > max_perc:
@@ -58,9 +59,32 @@ def prepare_imputation(ins_dict, missing_perc=0.35):
     if max_perc < missing_perc * 100:
         logging.info(f'The maximum percentage of missing information detected from '
                      f'instrument datasets is {max_perc}')
+        new_dict[k]['countna'] = np.zeros((new_dict[k].shape[0],))
     else:
         logging.warning(f'At leas one feature exceeds the maximum percentage of '
                         f'missing information, which is set at {missing_perc * 100}%')
+        logging.info(f'Searching for subjects with percentage of missing information > {missing_perc}')
+        for k in new_dict.keys():
+            mis_count_df = pd.DataFrame(
+                [new_dict[k][[c for c in new_dict[k].columns if
+                              not re.search('interview|relationship|respon|intersection', c)]].loc[
+                     gui].isna().astype(int)
+                 for gui in
+                 new_dict[k].index])
+            outidx = []
+            countna = []
+            for idx, row in mis_count_df.iterrows():
+                naperc = sum(row) / len(row)
+                if naperc > missing_perc:
+                    outidx.append(idx)
+                    countna.append(2)
+                elif naperc < 0.15:  # missing percentages > 0.35 are dropped
+                    countna.append(0)  # < 0.15 are labeled 0, > 0.15 are labeled 1
+                else:
+                    countna.append(1)
+            new_dict[k]['countna'] = countna
+            new_dict[k].drop(outidx, axis=0, inplace=True)
+            logging.info(f'{k.upper()}: Dropped {len(outidx)} subjects.')
     logging.info(f'The average percentage of missing information is {np.mean(all_perc)}')
     return new_dict
 
@@ -95,18 +119,45 @@ def impute_by_age(train_df, test_df):
     knnimpute = KNNImputer(n_neighbors=ut.neighbors)
     col_n = [nc for nc in train_df.columns if not re.search('subjectkey|interview|respon|relation', nc)]
     new_dict_tr, new_dict_ts = {}, {}
-    for yr in range(len(train_df.interview_period.unique())):
-        exp_tr = train_df.interview_period == ''.join(['P', str(yr + 1)])
-        exp_ts = test_df.interview_period == ''.join(['P', str(yr + 1)])
+    for yr in sorted(train_df.interview_period.unique()):
+        exp_tr = train_df.interview_period == yr
+        exp_ts = test_df.interview_period == yr
         tmp_tr = train_df.loc[exp_tr].copy()
         tmp_ts = test_df.loc[exp_ts].copy()
         tmp_tr[col_n] = knnimpute.fit_transform(tmp_tr[col_n])
         tmp_ts[col_n] = knnimpute.transform(tmp_ts[col_n])
-        new_dict_tr[''.join(['P', str(yr + 1)])] = tmp_tr
-        new_dict_ts[''.join(['P', str(yr + 1)])] = tmp_ts
+        new_dict_tr[yr] = tmp_tr
+        new_dict_ts[yr] = tmp_ts
     new_tr = pd.concat([df for df in new_dict_tr.values()])
     new_ts = pd.concat([df for df in new_dict_ts.values()])
     return new_tr, new_ts
+
+
+def impute(train_df, test_df):
+    """
+    Function that perform missing data imputation
+    on both train and test for a unique interview period.
+
+    Parameters
+    ----------
+    train_df: dataframe feature names and interview-based names
+    test_df: dataframe feature names and interview-based names
+    Returns
+    ------
+    imputed dataframe train
+    imputed dataframe test
+    """
+    knnimpute = KNNImputer(n_neighbors=ut.neighbors)
+    col_n = [nc for nc in train_df.columns if not re.search('interview', nc)]
+    col_out = [nc for nc in train_df.columns if re.search('interview', nc)]
+    tmp_tr = pd.DataFrame(knnimpute.fit_transform(train_df[col_n]), columns = col_n)
+    tmp_ts = pd.DataFrame(knnimpute.transform(test_df[col_n]), columns = col_n)
+    tmp_tr.index = train_df.index
+    tmp_ts.index = test_df.index
+    for c in col_out:
+        tmp_tr[c] = train_df[c]
+        tmp_ts[c] = test_df[c]
+    return tmp_tr, tmp_ts
 
 
 def imputation_eval(df, alpha, n_iter, n_neighbors, mdp='MCAR', ins_col_dict=None):
